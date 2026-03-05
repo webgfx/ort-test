@@ -19,7 +19,7 @@ const config = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'config.jso
 
 const LLAMA_CPP_ROOT = config.paths['llama.cpp'] || 'E:\\workspace\\project\\test\\llama.cpp';
 const MODEL_ROOT = config.paths.models;
-const RESULTS_DIR = path.resolve(path.join(__dirname, '..', 'gitignore', 'results'));
+const RESULTS_DIR = config.paths.results || path.resolve(path.join(__dirname, '..', 'gitignore', 'results'));
 
 const DEFAULT_PROMPT_LENGTHS = [128, 256, 512, 1024, 2048, 4096];
 

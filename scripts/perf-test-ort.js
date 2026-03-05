@@ -1,20 +1,20 @@
 /**
- * Run model perf test.
+ * Run ORT GenAI perf test with result saving.
  * - For WebGPU (default): uses model_benchmark.exe (native C++ build)
- * - For CUDA/CPU: uses Python onnxruntime-genai package (pip install onnxruntime-genai-cuda)
+ * - For CUDA/CPU: uses Python onnxruntime-genai package
  *
  * Usage:
- *   node scripts/perf-test.js                                    # WebGPU (default)
- *   node scripts/perf-test.js --ep cuda                          # CUDA via Python
- *   node scripts/perf-test.js --ep cpu                           # CPU via Python
- *   node scripts/perf-test.js --model Phi-4-mini-instruct-Edge
- *   node scripts/perf-test.js --prompt "Tell me a story"
- *   node scripts/perf-test.js --iterations 10 --warmup 3
+ *   node scripts/perf-test-ort.js                                    # WebGPU, default model, sweep prompt lengths
+ *   node scripts/perf-test-ort.js -m Qwen3-1.7B                     # Specific model
+ *   node scripts/perf-test-ort.js --ep cuda                          # CUDA via Python
+ *   node scripts/perf-test-ort.js -pl 256                            # Single prompt length
+ *   node scripts/perf-test-ort.js --iterations 10 --warmup 3
  */
 
-const { spawn } = require('child_process');
+const { spawn, spawnSync, execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { getSystemInfo } = require('./common');
 
 const config = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'config.json'), 'utf8'));
@@ -24,18 +24,22 @@ const GENAI_PATH = config.paths['onnxruntime-genai'];
 const BUILD_CONFIG = config.build.config;
 const OS_DIR = process.platform === 'win32' ? 'Windows' : 'Linux';
 const BIN_DIR = path.resolve(path.join(__dirname, '..', config.paths.bin));
+const ORT_BACKUP_ROOT = config.paths['ort-backup'] || path.join(BIN_DIR, '..', 'ort-backup');
 const MODEL_ROOT = config.paths.models;
-const BENCHMARK_EXE = path.join(BIN_DIR, 'model_benchmark.exe');
+const AI_MODEL_ROOT = config.paths['ai-models'] || MODEL_ROOT;
+const RESULTS_DIR = config.paths.results || path.resolve(path.join(__dirname, '..', 'gitignore', 'results'));
 
 // ORT install directory: <onnxruntime>/install/<config>
 const ORT_INSTALL_DIR = path.join(ORT_PATH, 'install', BUILD_CONFIG);
 
+const DEFAULT_PROMPT_LENGTHS = [128, 256, 512, 1024, 2048, 4096];
+
 // ============================================================
-// Copy binaries from build outputs to gitignore/bin
+// Copy binaries to dated backup directory
 // ============================================================
 
-function copyBinaries() {
-  const sources = {
+function getBinarySources() {
+  return {
     // From ORT install
     'onnxruntime.dll': path.join(ORT_INSTALL_DIR, 'bin', 'onnxruntime.dll'),
 
@@ -47,36 +51,129 @@ function copyBinaries() {
     'model_benchmark.exe': path.join(GENAI_PATH, 'build', OS_DIR, BUILD_CONFIG, 'benchmark', 'c', BUILD_CONFIG, 'model_benchmark.exe'),
     'onnxruntime-genai.dll': path.join(GENAI_PATH, 'build', OS_DIR, BUILD_CONFIG, BUILD_CONFIG, 'onnxruntime-genai.dll'),
   };
+}
 
-  fs.mkdirSync(BIN_DIR, { recursive: true });
-  console.log(`Copying binaries to: ${BIN_DIR}\n`);
+/**
+ * Get the date string (yyyymmdd) from model_benchmark.exe's modification time.
+ */
+function getBenchmarkDate() {
+  const sources = getBinarySources();
+  const exeSrc = sources['model_benchmark.exe'];
+
+  // Try source build output first
+  if (fs.existsSync(exeSrc)) {
+    const mtime = fs.statSync(exeSrc).mtime;
+    return formatDate(mtime);
+  }
+
+  // Fallback: check existing BIN_DIR
+  const localExe = path.join(BIN_DIR, 'model_benchmark.exe');
+  if (fs.existsSync(localExe)) {
+    const mtime = fs.statSync(localExe).mtime;
+    return formatDate(mtime);
+  }
+
+  return null;
+}
+
+function formatDate(d) {
+  return [
+    d.getFullYear(),
+    String(d.getMonth() + 1).padStart(2, '0'),
+    String(d.getDate()).padStart(2, '0'),
+  ].join('');
+}
+
+/**
+ * Copy binaries to E:\...\backup\ort\<date> if the dated dir doesn't exist.
+ */
+function copyBinaries() {
+  const dateStr = getBenchmarkDate();
+  if (!dateStr) {
+    console.log('No build outputs found to copy. Skipping backup.\n');
+    return;
+  }
+
+  const backupDir = path.join(ORT_BACKUP_ROOT, dateStr);
+
+  // If dated directory already has model_benchmark.exe, skip copying
+  if (fs.existsSync(path.join(backupDir, 'model_benchmark.exe'))) {
+    console.log(`Binaries already backed up at: ${backupDir}\n`);
+    return;
+  }
+
+  const sources = getBinarySources();
+  fs.mkdirSync(backupDir, { recursive: true });
+  console.log(`Copying binaries to: ${backupDir}\n`);
 
   let success = 0;
   let failed = 0;
 
   for (const [name, src] of Object.entries(sources)) {
-    const dest = path.join(BIN_DIR, name);
+    const dest = path.join(backupDir, name);
     if (fs.existsSync(src)) {
-      // Only copy if source is newer than destination
-      if (!fs.existsSync(dest) || fs.statSync(src).mtimeMs > fs.statSync(dest).mtimeMs) {
-        fs.copyFileSync(src, dest);
-        const size = (fs.statSync(dest).size / 1024).toFixed(0);
-        console.log(`  [COPIED] ${name} (${size} KB)`);
-      } else {
-        console.log(`  [UP-TO-DATE] ${name}`);
-      }
+      fs.copyFileSync(src, dest);
+      const size = (fs.statSync(dest).size / 1024).toFixed(0);
+      console.log(`  [COPIED] ${name} (${size} KB)`);
       success++;
     } else {
-      console.error(`  [MISSING] ${name} - expected at: ${src}`);
-      failed++;
+      // Try from local BIN_DIR as fallback
+      const localSrc = path.join(BIN_DIR, name);
+      if (fs.existsSync(localSrc)) {
+        fs.copyFileSync(localSrc, dest);
+        const size = (fs.statSync(dest).size / 1024).toFixed(0);
+        console.log(`  [COPIED] ${name} from local bin (${size} KB)`);
+        success++;
+      } else {
+        console.error(`  [MISSING] ${name} - expected at: ${src}`);
+        failed++;
+      }
     }
   }
 
-  console.log(`\nDone: ${success} ready, ${failed} missing.`);
+  console.log(`\nDone: ${success} copied, ${failed} missing.`);
   if (failed > 0) {
     console.error('Some binaries are missing. Run "node scripts/build-ort.js all" first.');
     process.exit(1);
   }
+}
+
+/**
+ * List available ORT backup versions (yyyymmdd dirs), newest first.
+ */
+function getAvailableVersions() {
+  if (!fs.existsSync(ORT_BACKUP_ROOT)) return [];
+  return fs.readdirSync(ORT_BACKUP_ROOT, { withFileTypes: true })
+    .filter(d => d.isDirectory() && /^\d{8}$/.test(d.name)
+      && fs.existsSync(path.join(ORT_BACKUP_ROOT, d.name, 'model_benchmark.exe')))
+    .map(d => d.name)
+    .sort((a, b) => b.localeCompare(a));  // newest first
+}
+
+/**
+ * Resolve the bin directory for running benchmarks.
+ * Uses the specified version or the latest available backup.
+ */
+function resolveBinDir(requestedVersion) {
+  if (requestedVersion) {
+    const dir = path.join(ORT_BACKUP_ROOT, requestedVersion);
+    if (!fs.existsSync(path.join(dir, 'model_benchmark.exe'))) {
+      const available = getAvailableVersions();
+      console.error(`ORT version ${requestedVersion} not found.`);
+      console.error(`Available: ${available.length > 0 ? available.join(', ') : '(none)'}`);
+      process.exit(1);
+    }
+    return dir;
+  }
+
+  const versions = getAvailableVersions();
+  if (versions.length === 0) {
+    console.error(`No ORT backups found in ${ORT_BACKUP_ROOT}.`);
+    console.error('Run "node scripts/build-ort.js all" first, then run this script to copy binaries.');
+    process.exit(1);
+  }
+
+  return path.join(ORT_BACKUP_ROOT, versions[0]);
 }
 
 // ============================================================
@@ -86,8 +183,8 @@ function copyBinaries() {
 function parseArgs() {
   const args = process.argv.slice(2);
   const opts = {
-    model: Object.keys(config.models)[0],
-    promptLength: config.perf.promptTokens,
+    models: [Object.keys(config.models)[0]],
+    promptLengths: null,       // null = use DEFAULT_PROMPT_LENGTHS
     genLength: config.perf.genTokens,
     prompt: null,
     iterations: config.perf.iterations,
@@ -95,17 +192,26 @@ function parseArgs() {
     verbose: false,
     maxLength: 0,
     ep: null,  // execution provider: cuda, cpu (default: WebGPU via native build)
+    ortVersion: null,  // ORT backup version (yyyymmdd), null = latest
   };
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
       case '--model':
-      case '-m':
-        opts.model = args[++i];
+      case '-m': {
+        const val = args[++i];
+        const newModels = val.split(',').map(s => s.trim()).filter(Boolean);
+        if (opts._modelOverridden) {
+          opts.models.push(...newModels);
+        } else {
+          opts.models = newModels;
+          opts._modelOverridden = true;
+        }
         break;
+      }
       case '--prompt-length':
       case '-pl':
-        opts.promptLength = parseInt(args[++i]);
+        opts.promptLengths = [parseInt(args[++i])];
         break;
       case '--gen-length':
       case '-gl':
@@ -130,6 +236,10 @@ function parseArgs() {
       case '-e':
         opts.ep = args[++i];
         break;
+      case '--ort-version':
+      case '-V':
+        opts.ortVersion = args[++i];
+        break;
       case '--verbose':
       case '-v':
         opts.verbose = true;
@@ -145,17 +255,22 @@ function parseArgs() {
     }
   }
 
+  if (!opts.promptLengths) {
+    opts.promptLengths = DEFAULT_PROMPT_LENGTHS;
+  }
+
   return opts;
 }
 
 function printHelp() {
   console.log(`
-Usage: node scripts/perf-test.js [options]
+Usage: node scripts/perf-test-ort.js [options]
 
 Options:
-  -m, --model <name>          Model name (default: ${Object.keys(config.models)[0]})
+  -m, --model <name>          Model name(s), comma-separated (default: ${Object.keys(config.models)[0]})
   -e, --ep <provider>         Execution provider: cuda, cpu (default: WebGPU via native build)
-  -pl, --prompt-length <n>    Number of prompt tokens (default: ${config.perf.promptTokens})
+  -V, --ort-version <date>    ORT backup version to use, yyyymmdd (default: latest)
+  -pl, --prompt-length <n>    Single prompt length (default: sweep ${DEFAULT_PROMPT_LENGTHS.join(',')})
   -gl, --gen-length <n>       Number of tokens to generate (default: ${config.perf.genTokens})
       --prompt <text>         Use specific prompt text instead of generated prompt
   -r, --iterations <n>        Number of benchmark iterations (default: ${config.perf.iterations})
@@ -163,10 +278,136 @@ Options:
   -ml, --max-length <n>       Max sequence length (0 = auto)
   -v, --verbose               Verbose output
   -h, --help                  Show this help
-
-Available models:
-${Object.keys(config.models).map(m => `  - ${m}`).join('\n')}
 `);
+}
+
+// ============================================================
+// Find model path
+// ============================================================
+
+/**
+ * Resolve model name to a directory containing genai_config.json.
+ * Searches: direct path, MODEL_ROOT/<name>, MODEL_ROOT/<name>/onnx, config.models entries.
+ */
+function findModelPath(modelName) {
+  // Direct absolute/relative path
+  if (fs.existsSync(path.join(modelName, 'genai_config.json'))) {
+    return path.resolve(modelName);
+  }
+  // Direct path with /onnx or /webgpu subdirectory
+  for (const sub of ['onnx', 'webgpu']) {
+    const subDir = path.join(modelName, sub);
+    if (fs.existsSync(path.join(subDir, 'genai_config.json'))) {
+      return path.resolve(subDir);
+    }
+  }
+
+  // Search in MODEL_ROOT and AI_MODEL_ROOT
+  const roots = [MODEL_ROOT, AI_MODEL_ROOT].filter((v, i, a) => a.indexOf(v) === i);
+  for (const root of roots) {
+    const modelDir = path.join(root, modelName);
+    if (fs.existsSync(path.join(modelDir, 'genai_config.json'))) {
+      return modelDir;
+    }
+    for (const sub of ['onnx', 'webgpu']) {
+      const subDir = path.join(modelDir, sub);
+      if (fs.existsSync(path.join(subDir, 'genai_config.json'))) {
+        return subDir;
+      }
+    }
+  }
+
+  // Check config.models
+  const modelInfo = config.models[modelName];
+  if (modelInfo) {
+    const configPath = path.join(MODEL_ROOT, modelInfo.path);
+    if (fs.existsSync(path.join(configPath, 'genai_config.json'))) {
+      return configPath;
+    }
+    for (const sub of ['onnx', 'webgpu']) {
+      const subDir = path.join(configPath, sub);
+      if (fs.existsSync(path.join(subDir, 'genai_config.json'))) {
+        return subDir;
+      }
+    }
+  }
+
+  return null;
+}
+
+// ============================================================
+// Parse benchmark output
+// ============================================================
+
+function parseBenchmarkOutput(stdout) {
+  const result = {};
+
+  // Prompt processing (time to first token)
+  const ppAvgUs = stdout.match(/Prompt processing[\s\S]*?avg \(us\):\s+([\d.]+)/);
+  const ppAvgTs = stdout.match(/Prompt processing[\s\S]*?avg \(tokens\/s\):\s+([\d.]+)/);
+  const ppStddev = stdout.match(/Prompt processing[\s\S]*?stddev \(us\):\s+([\d.]+)/);
+
+  // Token generation
+  const tgAvgUs = stdout.match(/Token generation[\s\S]*?avg \(us\):\s+([\d.]+)/);
+  const tgAvgTs = stdout.match(/Token generation[\s\S]*?avg \(tokens\/s\):\s+([\d.]+)/);
+  const tgStddev = stdout.match(/Token generation[\s\S]*?stddev \(us\):\s+([\d.]+)/);
+
+  // E2E
+  const e2eAvgMs = stdout.match(/E2E generation[\s\S]*?avg \(ms\):\s+([\d.]+)/);
+
+  // Peak memory
+  const peakMem = stdout.match(/Peak working set size \(bytes\):\s+(\d+)/);
+
+  if (ppAvgUs) result.ttftMs = parseFloat(ppAvgUs[1]) / 1000;       // us -> ms
+  if (ppAvgTs) result.ppTs = parseFloat(ppAvgTs[1]);
+  if (ppStddev) result.ppStddevUs = parseFloat(ppStddev[1]);
+  if (tgAvgUs) result.tgAvgUs = parseFloat(tgAvgUs[1]);
+  if (tgAvgTs) result.tgTs = parseFloat(tgAvgTs[1]);
+  if (tgStddev) result.tgStddevUs = parseFloat(tgStddev[1]);
+  if (e2eAvgMs) result.e2eMs = parseFloat(e2eAvgMs[1]);
+  if (peakMem) result.peakMemoryBytes = parseInt(peakMem[1]);
+
+  return result;
+}
+
+// ============================================================
+// Run a single benchmark
+// ============================================================
+
+function runBenchOnce(binDir, modelPath, pl, genLength, iterations, warmup, maxLength, ep, verbose) {
+  const benchExe = path.join(binDir, 'model_benchmark.exe');
+  const benchArgs = [
+    '-i', modelPath,
+    '-l', pl.toString(),
+    '-g', genLength.toString(),
+    '-r', iterations.toString(),
+    '-w', warmup.toString(),
+  ];
+
+  if (ep) {
+    benchArgs.push('-e', ep);
+  }
+
+  if (maxLength > 0) {
+    benchArgs.push('-ml', maxLength.toString());
+  }
+
+  if (verbose) {
+    benchArgs.push('-v');
+  }
+
+  const result = spawnSync(benchExe, benchArgs, {
+    cwd: binDir,
+    encoding: 'utf8',
+    timeout: 600000,
+    env: { ...process.env, PATH: `${binDir};${process.env.PATH}` },
+  });
+
+  if (result.status !== 0) {
+    return { error: result.stderr || result.stdout || `Exit code ${result.status}` };
+  }
+
+  return { data: parseBenchmarkOutput(result.stdout), raw: result.stdout };
 }
 
 // ============================================================
@@ -176,88 +417,160 @@ ${Object.keys(config.models).map(m => `  - ${m}`).join('\n')}
 function main() {
   const opts = parseArgs();
 
-  // Validate model
-  const modelInfo = config.models[opts.model];
-  if (!modelInfo) {
-    console.error(`Unknown model: ${opts.model}`);
-    console.error(`Available models: ${Object.keys(config.models).join(', ')}`);
-    process.exit(1);
+  // Copy new build outputs to backup (independent of benchmark run)
+  let binDir = BIN_DIR;
+  if (!opts.ep || opts.ep === 'webgpu' || opts.ep === 'dml') {
+    copyBinaries();
+    binDir = resolveBinDir(opts.ortVersion);
+    console.log(`Using ORT binaries from: ${binDir}\n`);
   }
 
-  const modelPath = path.join(MODEL_ROOT, modelInfo.path);
-  if (!fs.existsSync(modelPath)) {
-    console.error(`Model directory not found: ${modelPath}`);
-    process.exit(1);
+  // Resolve all model paths
+  const modelEntries = [];
+  for (const modelName of opts.models) {
+    const modelPath = findModelPath(modelName);
+    if (!modelPath) {
+      console.error(`Model not found: ${modelName}`);
+      console.error(`Searched: ${modelName}, ${MODEL_ROOT}/${modelName}, ${MODEL_ROOT}/${modelName}/onnx, config.models`);
+      process.exit(1);
+    }
+    modelEntries.push({ name: modelName, path: modelPath });
   }
 
-  // Dispatch: CUDA/CPU use Python genai package, WebGPU/default use native model_benchmark.exe
+  // For CUDA/CPU with Python runner, delegate (single prompt length only)
   if (opts.ep === 'cuda' || opts.ep === 'cpu') {
-    runPython(opts, modelPath);
-  } else {
-    runNative(opts, modelPath);
-  }
-}
-
-/**
- * Run via native model_benchmark.exe (WebGPU / default EP)
- */
-function runNative(opts, modelPath) {
-  // Copy binaries (skips if up-to-date)
-  copyBinaries();
-
-  const args = [
-    '-i', modelPath,
-    '-g', opts.genLength.toString(),
-    '-r', opts.iterations.toString(),
-    '-w', opts.warmup.toString(),
-  ];
-
-  if (opts.prompt) {
-    args.push('--prompt', opts.prompt);
-  } else {
-    args.push('-l', opts.promptLength.toString());
+    for (const { name, path: modelPath } of modelEntries) {
+      runPython({ ...opts, model: name }, modelPath);
+    }
+    return;
   }
 
-  if (opts.maxLength > 0) {
-    args.push('-ml', opts.maxLength.toString());
-  }
+  // Native WebGPU benchmark with sweep
+  const sysInfo = getSystemInfo();
+  const epName = opts.ep || 'webgpu';
 
-  if (opts.ep) {
-    args.push('-e', opts.ep);
-  }
+  // Create timestamped result folder
+  const now = new Date();
+  const timestamp = [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, '0'),
+    String(now.getDate()).padStart(2, '0'),
+    String(now.getHours()).padStart(2, '0'),
+    String(now.getMinutes()).padStart(2, '0'),
+    String(now.getSeconds()).padStart(2, '0'),
+  ].join('');
+  const resultDir = path.join(RESULTS_DIR, timestamp);
+  fs.mkdirSync(resultDir, { recursive: true });
 
-  if (opts.verbose) {
-    args.push('-v');
+  console.log(`${'='.repeat(60)}`);
+  console.log(`ORT GenAI Benchmark`);
+  console.log(`Models:      ${opts.models.join(', ')}`);
+  for (const me of modelEntries) {
+    console.log(`  ${me.name}: ${me.path}`);
   }
-
-  console.log(`\n${'='.repeat(60)}`);
-  console.log(`Model:       ${opts.model}`);
-  console.log(`EP:          ${opts.ep || '(default/WebGPU)'}`);
-  console.log(`Runner:      model_benchmark.exe (native)`);
-  console.log(`Model path:  ${modelPath}`);
-  console.log(`Prompt:      ${opts.prompt || `${opts.promptLength} tokens (generated)`}`);
-  console.log(`Gen tokens:  ${opts.genLength}`);
+  console.log(`EP:          ${epName}`);
+  console.log(`Prompt lens: ${opts.promptLengths.join(', ')}`);
+  console.log(`Gen length:  ${opts.genLength}`);
   console.log(`Iterations:  ${opts.iterations} (warmup: ${opts.warmup})`);
+  console.log(`GPU:         ${sysInfo.gpu}`);
+  console.log(`Results:     ${resultDir}`);
   console.log(`${'='.repeat(60)}\n`);
 
-  const child = spawn(BENCHMARK_EXE, args, {
-    cwd: BIN_DIR,
-    stdio: 'inherit',
-    env: { ...process.env, PATH: `${BIN_DIR};${process.env.PATH}` },
-  });
+  const allResults = {
+    system: sysInfo,
+    config: {
+      ep: epName,
+      genLength: opts.genLength,
+      iterations: opts.iterations,
+      warmup: opts.warmup,
+      promptLengths: opts.promptLengths,
+    },
+    results: [],
+  };
 
-  child.on('close', (code) => {
-    if (code !== 0) {
-      console.error(`\nmodel_benchmark exited with code ${code}`);
-      process.exit(code);
+  for (const { name: modelName, path: modelPath } of modelEntries) {
+    console.log(`\n=== Model: ${modelName} ===\n`);
+
+    for (const pl of opts.promptLengths) {
+      process.stdout.write(`  pl=${pl}, gl=${opts.genLength} ... `);
+
+      const result = runBenchOnce(binDir, modelPath, pl, opts.genLength, opts.iterations, opts.warmup, opts.maxLength, opts.ep, opts.verbose);
+
+      if (result.error) {
+        console.log(`ERROR: ${result.error.split('\n')[0]}`);
+        allResults.results.push({ model: modelName, ep: epName, pp: pl, tg: opts.genLength, error: result.error });
+      } else if (result.data) {
+        const d = result.data;
+        const record = {
+          model: modelName,
+          ep: epName,
+          pp: pl,
+          tg: opts.genLength,
+          ttftMs: d.ttftMs,
+          ppTs: d.ppTs,
+          tgTs: d.tgTs,
+          tgStddevUs: d.tgStddevUs,
+          e2eMs: d.e2eMs,
+          peakMemoryBytes: d.peakMemoryBytes,
+        };
+        allResults.results.push(record);
+
+        const parts = [];
+        if (d.ttftMs != null) parts.push(`TTFT: ${d.ttftMs.toFixed(1)} ms`);
+        if (d.tgTs != null) parts.push(`TPS: ${d.tgTs.toFixed(1)} t/s`);
+        if (d.e2eMs != null) parts.push(`E2E: ${d.e2eMs.toFixed(0)} ms`);
+        console.log(parts.join('  |  '));
+      }
     }
-    console.log('\nBenchmark completed.');
-  });
+  }
 
-  child.on('error', (err) => {
-    console.error(`Failed to start model_benchmark: ${err.message}`);
-    process.exit(1);
-  });
+  // Write JSON results
+  const resultFile = path.join(resultDir, 'ort-results.json');
+  fs.writeFileSync(resultFile, JSON.stringify(allResults, null, 2));
+
+  // Write human-readable summary
+  const summaryLines = [
+    `ORT GenAI Benchmark Results`,
+    `${'='.repeat(60)}`,
+    ``,
+    `System Information`,
+    `  CPU:        ${sysInfo.cpu}`,
+    `  CPU Cores:  ${sysInfo.cpuCores}`,
+    `  GPU:        ${sysInfo.gpu}`,
+    `  GPU Driver: ${sysInfo.gpuDriver}`,
+    `  GPU Memory: ${sysInfo.gpuMemoryMB || 'N/A'} MB`,
+    `  OS:         ${sysInfo.os}`,
+    `  RAM:        ${sysInfo.totalMemoryGB} GB`,
+    `  Timestamp:  ${sysInfo.timestamp}`,
+    ``,
+    `Test Configuration`,
+    `  EP:         ${epName}`,
+    `  Gen Length: ${opts.genLength}`,
+    `  Iterations: ${opts.iterations}`,
+    `  Warmup:     ${opts.warmup}`,
+    ``,
+    `Results`,
+    `${'='.repeat(92)}`,
+    `${'Model'.padEnd(22)} ${'EP'.padEnd(10)} ${'PP'.padEnd(6)} ${'TTFT (ms)'.padEnd(12)} ${'TPS (t/s)'.padEnd(12)} ${'PP (t/s)'.padEnd(12)} ${'E2E (ms)'.padEnd(10)}`,
+    `${'-'.repeat(92)}`,
+  ];
+
+  for (const r of allResults.results) {
+    if (r.error) {
+      summaryLines.push(`${(r.model || '').padEnd(22)} ${(r.ep || '').padEnd(10)} ${String(r.pp).padEnd(6)} ERROR: ${r.error.split('\n')[0]}`);
+    } else if (r.ttftMs !== undefined) {
+      summaryLines.push(
+        `${(r.model || '').padEnd(22)} ${(r.ep || '').padEnd(10)} ${String(r.pp).padEnd(6)} ${String(r.ttftMs?.toFixed(2) || '').padEnd(12)} ${String(r.tgTs?.toFixed(2) || '').padEnd(12)} ${String(r.ppTs?.toFixed(2) || '').padEnd(12)} ${String(r.e2eMs?.toFixed(0) || '').padEnd(10)}`
+      );
+    }
+  }
+
+  const summaryFile = path.join(resultDir, 'ort-results.txt');
+  fs.writeFileSync(summaryFile, summaryLines.join('\n'));
+
+  console.log(`\nResults saved to:`);
+  console.log(`  JSON: ${resultFile}`);
+  console.log(`  Text: ${summaryFile}`);
 }
 
 /**
@@ -270,24 +583,20 @@ function runPython(opts, modelPath) {
   console.log(`EP:          ${opts.ep}`);
   console.log(`Runner:      Python onnxruntime-genai`);
   console.log(`Model path:  ${modelPath}`);
-  console.log(`Prompt:      ${opts.prompt || `${opts.promptLength} tokens`}`);
   console.log(`Gen tokens:  ${opts.genLength}`);
   console.log(`Iterations:  ${opts.iterations} (warmup: ${opts.warmup})`);
   console.log(`${'='.repeat(60)}\n`);
 
   const pyArgs = [
-    path.join(__dirname, 'perf-test-genai.py'),
+    path.join(__dirname, 'perf-test-ort.py'),
     '-m', opts.model,
     '-e', opts.ep,
     '-g', opts.genLength.toString(),
     '-r', opts.iterations.toString(),
     '-w', opts.warmup.toString(),
-    '-l', opts.promptLength.toString(),
+    '-l', (opts.promptLengths[0] || 16).toString(),
   ];
 
-  if (opts.prompt) {
-    pyArgs.push('--prompt', opts.prompt);
-  }
   if (opts.verbose) {
     pyArgs.push('-v');
   }

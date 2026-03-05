@@ -3,8 +3,11 @@
     "onnxruntime": "E:\\workspace\\project\\test\\onnxruntime",
     "onnxruntime-genai": "E:\\workspace\\project\\test\\onnxruntime-genai",
     "models": "E:\\workspace\\project\\test\\ort-models",
+    "ai-models": "E:\\workspace\\project\\test\\ai-models",
     "bin": "gitignore/bin",
-    "llama.cpp": "E:\\workspace\\project\\test\\llama.cpp"
+    "ort-backup": "E:\\workspace\\project\\test\\backup\\ort",
+    "results": "E:\\workspace\\project\\test\\backup\\results",
+    "llama.cpp": "E:\\workspace\\project\\test\\backup\\llamacpp"
   },
   "build": {
     "config": "Release"
