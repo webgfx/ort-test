@@ -193,6 +193,7 @@ function parseArgs() {
     maxLength: 0,
     ep: null,  // execution provider: cuda, cpu (default: WebGPU via native build)
     ortVersion: null,  // ORT backup version (yyyymmdd), null = latest
+    graphCapture: null, // null = don't change, true = enable, false = disable
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -240,6 +241,12 @@ function parseArgs() {
       case '-V':
         opts.ortVersion = args[++i];
         break;
+      case '--gc':
+        opts.graphCapture = true;
+        break;
+      case '--no-gc':
+        opts.graphCapture = false;
+        break;
       case '--verbose':
       case '-v':
         opts.verbose = true;
@@ -270,6 +277,8 @@ Options:
   -m, --model <name>          Model name(s), comma-separated (default: ${Object.keys(config.models)[0]})
   -e, --ep <provider>         Execution provider: cuda, cpu (default: WebGPU via native build)
   -V, --ort-version <date>    ORT backup version to use, yyyymmdd (default: latest)
+  --gc                        Enable graph capture in genai_config.json
+  --no-gc                     Disable graph capture in genai_config.json
   -pl, --prompt-length <n>    Single prompt length (default: sweep ${DEFAULT_PROMPT_LENGTHS.join(',')})
   -gl, --gen-length <n>       Number of tokens to generate (default: ${config.perf.genTokens})
       --prompt <text>         Use specific prompt text instead of generated prompt
@@ -339,11 +348,10 @@ function findModelPath(modelName) {
 // Parse benchmark output
 // ============================================================
 
-function parseBenchmarkOutput(stdout) {
+function parseBenchmarkOutput(stdout, promptLength) {
   const result = {};
 
   // Prompt processing (time to first token)
-  const ppAvgUs = stdout.match(/Prompt processing[\s\S]*?avg \(us\):\s+([\d.]+)/);
   const ppAvgTs = stdout.match(/Prompt processing[\s\S]*?avg \(tokens\/s\):\s+([\d.]+)/);
   const ppStddev = stdout.match(/Prompt processing[\s\S]*?stddev \(us\):\s+([\d.]+)/);
 
@@ -358,8 +366,11 @@ function parseBenchmarkOutput(stdout) {
   // Peak memory
   const peakMem = stdout.match(/Peak working set size \(bytes\):\s+(\d+)/);
 
-  if (ppAvgUs) result.ttftMs = parseFloat(ppAvgUs[1]) / 1000;       // us -> ms
-  if (ppAvgTs) result.ppTs = parseFloat(ppAvgTs[1]);
+  if (ppAvgTs) {
+    result.plTs = parseFloat(ppAvgTs[1]);
+    // Derive TTFT from tokens/s: TTFT = promptLength / plTs * 1000 (ms)
+    result.ttftMs = promptLength / result.plTs * 1000;
+  }
   if (ppStddev) result.ppStddevUs = parseFloat(ppStddev[1]);
   if (tgAvgUs) result.tgAvgUs = parseFloat(tgAvgUs[1]);
   if (tgAvgTs) result.tgTs = parseFloat(tgAvgTs[1]);
@@ -407,7 +418,7 @@ function runBenchOnce(binDir, modelPath, pl, genLength, iterations, warmup, maxL
     return { error: result.stderr || result.stdout || `Exit code ${result.status}` };
   }
 
-  return { data: parseBenchmarkOutput(result.stdout), raw: result.stdout };
+  return { data: parseBenchmarkOutput(result.stdout, pl), raw: result.stdout };
 }
 
 // ============================================================
@@ -434,7 +445,33 @@ function main() {
       console.error(`Searched: ${modelName}, ${MODEL_ROOT}/${modelName}, ${MODEL_ROOT}/${modelName}/onnx, config.models`);
       process.exit(1);
     }
-    modelEntries.push({ name: modelName, path: modelPath });
+    // Read and optionally set enableGraphCapture in genai_config.json
+    let graphCapture = null;
+    let originalGraphCapture = null;
+    const genaiConfigPath = path.join(modelPath, 'genai_config.json');
+    if (fs.existsSync(genaiConfigPath)) {
+      try {
+        const genaiConfig = JSON.parse(fs.readFileSync(genaiConfigPath, 'utf8'));
+        const providerOpts = genaiConfig.model?.decoder?.session_options?.provider_options;
+        if (Array.isArray(providerOpts)) {
+          for (const po of providerOpts) {
+            const provider = po?.webgpu || po?.dml;
+            if (provider && 'enableGraphCapture' in provider) {
+              const current = provider.enableGraphCapture === '1' || provider.enableGraphCapture === 1;
+              originalGraphCapture = current;
+              if (opts.graphCapture != null && opts.graphCapture !== current) {
+                provider.enableGraphCapture = opts.graphCapture ? '1' : '0';
+                fs.writeFileSync(genaiConfigPath, JSON.stringify(genaiConfig, null, 4));
+                console.log(`  Updated enableGraphCapture to ${opts.graphCapture ? '1' : '0'} in ${genaiConfigPath}`);
+              }
+              graphCapture = opts.graphCapture != null ? opts.graphCapture : current;
+              break;
+            }
+          }
+        }
+      } catch {}
+    }
+    modelEntries.push({ name: modelName, path: modelPath, graphCapture, originalGraphCapture, genaiConfigPath });
   }
 
   // For CUDA/CPU with Python runner, delegate (single prompt length only)
@@ -466,7 +503,8 @@ function main() {
   console.log(`ORT GenAI Benchmark`);
   console.log(`Models:      ${opts.models.join(', ')}`);
   for (const me of modelEntries) {
-    console.log(`  ${me.name}: ${me.path}`);
+    const gcLabel = me.graphCapture != null ? (me.graphCapture ? 'enabled' : 'disabled') : 'unknown';
+    console.log(`  ${me.name}: ${me.path} (Graph Capture: ${gcLabel})`);
   }
   console.log(`EP:          ${epName}`);
   console.log(`Prompt lens: ${opts.promptLengths.join(', ')}`);
@@ -481,33 +519,35 @@ function main() {
     config: {
       ep: epName,
       genLength: opts.genLength,
-      iterations: opts.iterations,
+      runs: opts.iterations,
       warmup: opts.warmup,
       promptLengths: opts.promptLengths,
+      graphCapture: modelEntries.length === 1 ? modelEntries[0].graphCapture : undefined,
     },
     results: [],
   };
 
-  for (const { name: modelName, path: modelPath } of modelEntries) {
+  for (const { name: modelName, path: modelPath, graphCapture } of modelEntries) {
     console.log(`\n=== Model: ${modelName} ===\n`);
 
     for (const pl of opts.promptLengths) {
-      process.stdout.write(`  pl=${pl}, gl=${opts.genLength} ... `);
+      process.stdout.write(`  prompt_length=${pl}, gl=${opts.genLength} ... `);
 
       const result = runBenchOnce(binDir, modelPath, pl, opts.genLength, opts.iterations, opts.warmup, opts.maxLength, opts.ep, opts.verbose);
 
       if (result.error) {
         console.log(`ERROR: ${result.error.split('\n')[0]}`);
-        allResults.results.push({ model: modelName, ep: epName, pp: pl, tg: opts.genLength, error: result.error });
+        allResults.results.push({ model: modelName, ep: epName, pl, tg: opts.genLength, graphCapture, error: result.error });
       } else if (result.data) {
         const d = result.data;
         const record = {
           model: modelName,
           ep: epName,
-          pp: pl,
+          pl,
           tg: opts.genLength,
+          graphCapture,
           ttftMs: d.ttftMs,
-          ppTs: d.ppTs,
+          plTs: d.plTs,
           tgTs: d.tgTs,
           tgStddevUs: d.tgStddevUs,
           e2eMs: d.e2eMs,
@@ -546,21 +586,21 @@ function main() {
     `Test Configuration`,
     `  EP:         ${epName}`,
     `  Gen Length: ${opts.genLength}`,
-    `  Iterations: ${opts.iterations}`,
+    `  Runs:       ${opts.iterations}`,
     `  Warmup:     ${opts.warmup}`,
     ``,
     `Results`,
     `${'='.repeat(92)}`,
-    `${'Model'.padEnd(22)} ${'EP'.padEnd(10)} ${'PP'.padEnd(6)} ${'TTFT (ms)'.padEnd(12)} ${'TPS (t/s)'.padEnd(12)} ${'PP (t/s)'.padEnd(12)} ${'E2E (ms)'.padEnd(10)}`,
+    `${'Model'.padEnd(22)} ${'EP'.padEnd(10)} ${'PL'.padEnd(6)} ${'TTFT (ms)'.padEnd(12)} ${'TPS (t/s)'.padEnd(12)} ${'PL (t/s)'.padEnd(12)} ${'E2E (ms)'.padEnd(10)}`,
     `${'-'.repeat(92)}`,
   ];
 
   for (const r of allResults.results) {
     if (r.error) {
-      summaryLines.push(`${(r.model || '').padEnd(22)} ${(r.ep || '').padEnd(10)} ${String(r.pp).padEnd(6)} ERROR: ${r.error.split('\n')[0]}`);
+      summaryLines.push(`${(r.model || '').padEnd(22)} ${(r.ep || '').padEnd(10)} ${String(r.pl).padEnd(6)} ERROR: ${r.error.split('\n')[0]}`);
     } else if (r.ttftMs !== undefined) {
       summaryLines.push(
-        `${(r.model || '').padEnd(22)} ${(r.ep || '').padEnd(10)} ${String(r.pp).padEnd(6)} ${String(r.ttftMs?.toFixed(2) || '').padEnd(12)} ${String(r.tgTs?.toFixed(2) || '').padEnd(12)} ${String(r.ppTs?.toFixed(2) || '').padEnd(12)} ${String(r.e2eMs?.toFixed(0) || '').padEnd(10)}`
+        `${(r.model || '').padEnd(22)} ${(r.ep || '').padEnd(10)} ${String(r.pl).padEnd(6)} ${String(r.ttftMs?.toFixed(2) || '').padEnd(12)} ${String(r.tgTs?.toFixed(2) || '').padEnd(12)} ${String(r.plTs?.toFixed(2) || '').padEnd(12)} ${String(r.e2eMs?.toFixed(0) || '').padEnd(10)}`
       );
     }
   }
@@ -571,6 +611,27 @@ function main() {
   console.log(`\nResults saved to:`);
   console.log(`  JSON: ${resultFile}`);
   console.log(`  Text: ${summaryFile}`);
+
+  // Restore enableGraphCapture to original value if changed
+  for (const me of modelEntries) {
+    if (opts.graphCapture != null && me.originalGraphCapture != null && opts.graphCapture !== me.originalGraphCapture) {
+      try {
+        const genaiConfig = JSON.parse(fs.readFileSync(me.genaiConfigPath, 'utf8'));
+        const providerOpts = genaiConfig.model?.decoder?.session_options?.provider_options;
+        if (Array.isArray(providerOpts)) {
+          for (const po of providerOpts) {
+            const provider = po?.webgpu || po?.dml;
+            if (provider && 'enableGraphCapture' in provider) {
+              provider.enableGraphCapture = me.originalGraphCapture ? '1' : '0';
+              fs.writeFileSync(me.genaiConfigPath, JSON.stringify(genaiConfig, null, 4));
+              console.log(`Restored enableGraphCapture to ${me.originalGraphCapture ? '1' : '0'} in ${me.genaiConfigPath}`);
+              break;
+            }
+          }
+        }
+      } catch {}
+    }
+  }
 }
 
 /**

@@ -73,7 +73,8 @@ function normalizeResults(loaded) {
       if (source === 'llamacpp') {
         configLabel = `${r.model} / ${r.backend} (llama.cpp)`;
       } else if (source === 'ort') {
-        configLabel = `${r.model} / ${r.ep} (ORT)`;
+        const gcSuffix = r.graphCapture != null ? (r.graphCapture ? ', GC on' : ', GC off') : '';
+        configLabel = `${r.model} / ${r.ep}${gcSuffix} (ORT)`;
       } else {
         configLabel = `${r.model} / ${source}`;
       }
@@ -94,18 +95,18 @@ function normalizeResults(loaded) {
       }
 
       s.points.push({
-        pp: r.pp,
+        pl: r.pl || r.pp,  // support both old (pp) and new (pl) field names
         ttftMs: r.ttftMs,
         tgTs: r.tgTs,
-        ppTs: r.ppTs,
+        plTs: r.plTs || r.ppTs,
         e2eMs: r.e2eMs,
       });
     }
   }
 
-  // Sort points by pp within each series
+  // Sort points by pl within each series
   for (const s of series) {
-    s.points.sort((a, b) => a.pp - b.pp);
+    s.points.sort((a, b) => a.pl - b.pl);
   }
 
   return series;
@@ -115,9 +116,9 @@ function normalizeResults(loaded) {
 // Generate HTML report
 // ============================================================
 
-function generateHtml(series, outputPath) {
-  // Collect all unique pp values
-  const allPPs = [...new Set(series.flatMap(s => s.points.map(p => p.pp)))].sort((a, b) => a - b);
+function generateHtml(series, loaded, outputPath) {
+  // Collect all unique pl values
+  const allPLs = [...new Set(series.flatMap(s => s.points.map(p => p.pl)))].sort((a, b) => a - b);
 
   // Color palette
   const colors = [
@@ -130,8 +131,8 @@ function generateHtml(series, outputPath) {
   function buildDatasets(metric) {
     return series.map((s, i) => {
       const color = colors[i % colors.length];
-      const data = allPPs.map(pp => {
-        const pt = s.points.find(p => p.pp === pp);
+      const data = allPLs.map(pl => {
+        const pt = s.points.find(p => p.pl === pl);
         return pt ? pt[metric] : null;
       });
       return {
@@ -149,29 +150,26 @@ function generateHtml(series, outputPath) {
     });
   }
 
-  // Build bar datasets for comparison at each pp
-  function buildBarDatasets(metric) {
-    return series.map((s, i) => {
-      const color = colors[i % colors.length];
-      const data = allPPs.map(pp => {
-        const pt = s.points.find(p => p.pp === pp);
-        return pt ? pt[metric] : null;
-      });
-      return {
-        label: s.label,
-        data,
-        backgroundColor: color + 'CC',
-        borderColor: color,
-        borderWidth: 1,
-      };
-    });
-  }
-
   const ttftDatasets = JSON.stringify(buildDatasets('ttftMs'));
-  const tpsDatasets = JSON.stringify(buildDatasets('tgTs'));
-  const ttftBarDatasets = JSON.stringify(buildBarDatasets('ttftMs'));
-  const tpsBarDatasets = JSON.stringify(buildBarDatasets('tgTs'));
-  const ppLabels = JSON.stringify(allPPs.map(p => `PP=${p}`));
+  const prefillTpsDatasets = JSON.stringify(buildDatasets('plTs'));
+  const genTpsDatasets = JSON.stringify(buildDatasets('tgTs'));
+  const plLabels = JSON.stringify(allPLs.map(p => String(p)));
+
+  // Build config summary per run
+  const configSummaries = loaded.map(({ source, dirName, data }) => {
+    const c = data.config || {};
+    const parts = [`<strong>${dirName}</strong> (${source})`];
+    if (c.runs) parts.push(`Runs: ${c.runs}`);
+    if (c.iterations) parts.push(`Runs: ${c.iterations}`);
+    if (c.reps) parts.push(`Runs: ${c.reps}`);
+    if (c.warmup != null) parts.push(`Warmup: ${c.warmup}`);
+    if (c.graphCapture != null) parts.push(`Graph Capture: ${c.graphCapture ? 'enabled' : 'disabled'}`);
+    if (c.genLength) parts.push(`Gen Length: ${c.genLength}`);
+    if (c.ep) parts.push(`EP: ${c.ep}`);
+    if (c.backends) parts.push(`Backends: ${c.backends.join(', ')}`);
+    return parts.join(' &mdash; ');
+  });
+  const configInfoHtml = configSummaries.map(s => `<p class="config-line">${s}</p>`).join('\n    ');
 
   // Summary table
   const tableRows = series.flatMap(s =>
@@ -179,10 +177,10 @@ function generateHtml(series, outputPath) {
       <tr>
         <td>${s.shortLabel}</td>
         <td>${s.dirName}</td>
-        <td>${p.pp}</td>
+        <td>${p.pl}</td>
         <td>${p.ttftMs != null ? p.ttftMs.toFixed(2) : '-'}</td>
         <td>${p.tgTs != null ? p.tgTs.toFixed(2) : '-'}</td>
-        <td>${p.ppTs != null ? p.ppTs.toFixed(2) : '-'}</td>
+        <td>${p.plTs != null ? p.plTs.toFixed(2) : '-'}</td>
         <td>${p.e2eMs != null ? p.e2eMs.toFixed(0) : '-'}</td>
       </tr>`)
   ).join('');
@@ -211,7 +209,25 @@ function generateHtml(series, outputPath) {
     .subtitle {
       color: #8b949e;
       font-size: 14px;
-      margin-bottom: 32px;
+      margin-bottom: 16px;
+    }
+    .config-section {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 16px 20px;
+      margin-bottom: 28px;
+    }
+    .config-section h2 {
+      font-size: 14px;
+      font-weight: 600;
+      color: #f0f6fc;
+      margin-bottom: 8px;
+    }
+    .config-line {
+      color: #8b949e;
+      font-size: 13px;
+      margin: 4px 0;
     }
     .chart-grid {
       display: grid;
@@ -278,22 +294,23 @@ function generateHtml(series, outputPath) {
   <h1>Benchmark Comparison</h1>
   <p class="subtitle">Generated on ${new Date().toISOString().slice(0, 19).replace('T', ' ')} &mdash; Comparing ${series.map(s => s.dirName).filter((v, i, a) => a.indexOf(v) === i).join(', ')}</p>
 
+  <div class="config-section">
+    <h2>Test Configuration</h2>
+    ${configInfoHtml}
+  </div>
+
   <div class="chart-grid">
     <div class="chart-card">
       <h2>TTFT (Time to First Token) — Lower is Better</h2>
       <canvas id="ttftLine"></canvas>
     </div>
     <div class="chart-card">
-      <h2>TPS (Token Generation Speed) — Higher is Better</h2>
-      <canvas id="tpsLine"></canvas>
+      <h2>Prefill TPS (Prompt Processing Speed) — Higher is Better</h2>
+      <canvas id="prefillTpsLine"></canvas>
     </div>
-    <div class="chart-card">
-      <h2>TTFT by Prompt Length</h2>
-      <canvas id="ttftBar"></canvas>
-    </div>
-    <div class="chart-card">
-      <h2>TPS by Prompt Length</h2>
-      <canvas id="tpsBar"></canvas>
+    <div class="chart-card full-width">
+      <h2>Generation TPS (Token Generation Speed) — Higher is Better</h2>
+      <canvas id="genTpsLine"></canvas>
     </div>
   </div>
 
@@ -304,10 +321,10 @@ function generateHtml(series, outputPath) {
         <tr>
           <th>Configuration</th>
           <th>Run</th>
-          <th>PP</th>
+          <th>Prompt Length</th>
           <th>TTFT (ms)</th>
           <th>TPS (t/s)</th>
-          <th>PP (t/s)</th>
+          <th>PL (t/s)</th>
           <th>E2E (ms)</th>
         </tr>
       </thead>
@@ -317,7 +334,7 @@ function generateHtml(series, outputPath) {
   </div>
 
   <script>
-    const ppLabels = ${ppLabels};
+    const plLabels = ${plLabels};
 
     const chartDefaults = {
       color: '#c9d1d9',
@@ -336,7 +353,7 @@ function generateHtml(series, outputPath) {
     // TTFT Line Chart
     new Chart(document.getElementById('ttftLine'), {
       type: 'line',
-      data: { labels: ppLabels, datasets: ${ttftDatasets} },
+      data: { labels: plLabels, datasets: ${ttftDatasets} },
       options: {
         responsive: true,
         interaction: { mode: 'index', intersect: false },
@@ -351,10 +368,10 @@ function generateHtml(series, outputPath) {
       },
     });
 
-    // TPS Line Chart
-    new Chart(document.getElementById('tpsLine'), {
+    // Prefill TPS Line Chart
+    new Chart(document.getElementById('prefillTpsLine'), {
       type: 'line',
-      data: { labels: ppLabels, datasets: ${tpsDatasets} },
+      data: { labels: plLabels, datasets: ${prefillTpsDatasets} },
       options: {
         responsive: true,
         interaction: { mode: 'index', intersect: false },
@@ -364,41 +381,25 @@ function generateHtml(series, outputPath) {
         },
         scales: {
           x: { grid: gridOpts, title: { display: true, text: 'Prompt Length' } },
-          y: { grid: gridOpts, title: { display: true, text: 'TPS (tokens/s)' }, beginAtZero: true },
+          y: { grid: gridOpts, title: { display: true, text: 'Prefill TPS (tokens/s)' }, beginAtZero: true },
         },
       },
     });
 
-    // TTFT Bar Chart
-    new Chart(document.getElementById('ttftBar'), {
-      type: 'bar',
-      data: { labels: ppLabels, datasets: ${ttftBarDatasets} },
+    // Generation TPS Line Chart
+    new Chart(document.getElementById('genTpsLine'), {
+      type: 'line',
+      data: { labels: plLabels, datasets: ${genTpsDatasets} },
       options: {
         responsive: true,
+        interaction: { mode: 'index', intersect: false },
         plugins: {
-          legend: { position: 'bottom', labels: { padding: 16, usePointStyle: true, pointStyle: 'rect' } },
-          tooltip: { callbacks: { label: ctx => ctx.dataset.label + ': ' + (ctx.parsed.y?.toFixed(2) || '-') + ' ms' } },
-        },
-        scales: {
-          x: { grid: gridOpts },
-          y: { grid: gridOpts, title: { display: true, text: 'TTFT (ms)' }, beginAtZero: true },
-        },
-      },
-    });
-
-    // TPS Bar Chart
-    new Chart(document.getElementById('tpsBar'), {
-      type: 'bar',
-      data: { labels: ppLabels, datasets: ${tpsBarDatasets} },
-      options: {
-        responsive: true,
-        plugins: {
-          legend: { position: 'bottom', labels: { padding: 16, usePointStyle: true, pointStyle: 'rect' } },
+          legend: { position: 'bottom', labels: { padding: 16, usePointStyle: true, pointStyle: 'circle' } },
           tooltip: { callbacks: { label: ctx => ctx.dataset.label + ': ' + (ctx.parsed.y?.toFixed(2) || '-') + ' t/s' } },
         },
         scales: {
-          x: { grid: gridOpts },
-          y: { grid: gridOpts, title: { display: true, text: 'TPS (tokens/s)' }, beginAtZero: true },
+          x: { grid: gridOpts, title: { display: true, text: 'Prompt Length' } },
+          y: { grid: gridOpts, title: { display: true, text: 'Generation TPS (tokens/s)' }, beginAtZero: true },
         },
       },
     });
@@ -500,7 +501,7 @@ Options:
     console.log(`  ${s.label} (${s.points.length} points)`);
   }
 
-  const htmlPath = generateHtml(series, outputPath);
+  const htmlPath = generateHtml(series, allLoaded, outputPath);
   console.log(`\nReport saved to: ${htmlPath}`);
 
   return htmlPath;

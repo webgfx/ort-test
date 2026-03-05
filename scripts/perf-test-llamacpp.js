@@ -19,6 +19,7 @@ const config = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'config.jso
 
 const LLAMA_CPP_ROOT = config.paths['llama.cpp'] || 'E:\\workspace\\project\\test\\llama.cpp';
 const MODEL_ROOT = config.paths.models;
+const AI_MODEL_ROOT = config.paths['ai-models'] || MODEL_ROOT;
 const RESULTS_DIR = config.paths.results || path.resolve(path.join(__dirname, '..', 'gitignore', 'results'));
 
 const DEFAULT_PROMPT_LENGTHS = [128, 256, 512, 1024, 2048, 4096];
@@ -336,19 +337,29 @@ async function downloadLlamaCpp(version) {
 // ============================================================
 
 function findModel(modelName) {
-  const candidates = [
-    path.join(MODEL_ROOT, `${modelName.split('-Q')[0]}-GGUF`, `${modelName}.gguf`),
-    path.join(MODEL_ROOT, `${modelName}-GGUF`, `${modelName}.gguf`),
-    path.join(MODEL_ROOT, modelName, `${modelName}.gguf`),
-    path.join(MODEL_ROOT, `${modelName}.gguf`),
-  ];
+  const roots = [MODEL_ROOT, AI_MODEL_ROOT].filter((v, i, a) => a.indexOf(v) === i);
+  const candidates = [];
 
-  // Search GGUF dir for matching file
-  const ggufDir = path.join(MODEL_ROOT, `${modelName.split('-Q')[0]}-GGUF`);
-  if (fs.existsSync(ggufDir)) {
-    const files = fs.readdirSync(ggufDir).filter(f => f.endsWith('.gguf'));
-    const match = files.find(f => f.includes(modelName)) || files[0];
-    if (match) candidates.unshift(path.join(ggufDir, match));
+  for (const root of roots) {
+    candidates.push(
+      path.join(root, `${modelName.split('-Q')[0]}-GGUF`, `${modelName}.gguf`),
+      path.join(root, `${modelName}-GGUF`, `${modelName}.gguf`),
+      path.join(root, modelName, `${modelName}.gguf`),
+      path.join(root, `${modelName}.gguf`),
+    );
+
+    // Search subdirectories for matching GGUF files (case-insensitive)
+    if (fs.existsSync(root)) {
+      const dirs = fs.readdirSync(root, { withFileTypes: true }).filter(d => d.isDirectory());
+      for (const dir of dirs) {
+        const dirPath = path.join(root, dir.name);
+        try {
+          const files = fs.readdirSync(dirPath).filter(f => f.endsWith('.gguf'));
+          const match = files.find(f => f === `${modelName}.gguf`) || files.find(f => f.includes(modelName));
+          if (match) candidates.push(path.join(dirPath, match));
+        } catch {}
+      }
+    }
   }
 
   for (const p of candidates) {
@@ -544,7 +555,8 @@ async function main() {
     config: {
       models: opts.models,
       genLength: opts.gl,
-      reps: opts.reps,
+      runs: opts.reps,
+      warmup: 1,
       ngl: opts.ngl,
       promptLengths: opts.promptLengths,
       backends: availableBackends,
@@ -559,13 +571,13 @@ async function main() {
       console.log(`\n--- Backend: ${backend.toUpperCase()} ---\n`);
 
       for (const pl of opts.promptLengths) {
-        process.stdout.write(`  pp=${pl}, tg=${opts.gl} ... `);
+        process.stdout.write(`  prompt_length=${pl}, tg=${opts.gl} ... `);
 
         const result = runBench(backend, modelPath, pl, opts.gl, opts.reps, opts.ngl, versionDir);
 
         if (result.error) {
           console.log(`ERROR: ${result.error}`);
-          allResults.results.push({ model: modelName, backend, pp: pl, tg: opts.gl, error: result.error });
+          allResults.results.push({ model: modelName, backend, pl, tg: opts.gl, error: result.error });
         } else if (result.data) {
           // Combine pp (prefill) and tg (generation) into one record per prompt length
           const ppEntry = result.data.find(e => e.n_prompt > 0);
@@ -573,17 +585,17 @@ async function main() {
 
           // TTFT = prefill time in ms (avg_ns / 1e6)
           const ttftMs = ppEntry ? ppEntry.avg_ns / 1e6 : null;
-          const ppTs = ppEntry ? ppEntry.avg_ts : null;
+          const plTs = ppEntry ? ppEntry.avg_ts : null;
           const tgTs = tgEntry ? tgEntry.avg_ts : null;
 
           const record = {
             model: modelName,
             backend,
-            pp: pl,
+            pl,
             tg: opts.gl,
             ttftMs,           // Time to first token (prefill time in ms)
-            ppTs,             // Prefill throughput (tokens/s)
-            ppStddevTs: ppEntry?.stddev_ts,
+            plTs,             // Prefill throughput (tokens/s)
+            plStddevTs: ppEntry?.stddev_ts,
             tgTs,             // Generation throughput (tokens/s)
             tgStddevTs: tgEntry?.stddev_ts,
             modelType: (ppEntry || tgEntry)?.model_type,
@@ -601,7 +613,7 @@ async function main() {
           console.log(parts.join('  |  '));
         } else if (result.raw) {
           console.log('(raw output)');
-          allResults.results.push({ model: modelName, backend, pp: pl, tg: opts.gl, raw: result.raw });
+          allResults.results.push({ model: modelName, backend, pl, tg: opts.gl, raw: result.raw });
         }
       }
     }
@@ -629,21 +641,22 @@ async function main() {
     `Test Configuration`,
     `  llama.cpp:  ${llamaCppVersion} ${primaryVersion ? `(${primaryVersion.buildCommit})` : ''}`,
     `  Gen Length: ${opts.gl}`,
-    `  Reps:       ${opts.reps}`,
+    `  Runs:       ${opts.reps}`,
+    `  Warmup:     1 (llama-bench default)`,
     `  GPU Layers: ${opts.ngl}`,
     ``,
     `Results`,
     `${'='.repeat(70)}`,
-    `${'Model'.padEnd(22)} ${'Backend'.padEnd(10)} ${'PP'.padEnd(6)} ${'TTFT (ms)'.padEnd(12)} ${'TPS (t/s)'.padEnd(12)} ${'PP (t/s)'.padEnd(12)} ${'TG stddev'.padEnd(10)}`,
+    `${'Model'.padEnd(22)} ${'Backend'.padEnd(10)} ${'PL'.padEnd(6)} ${'TTFT (ms)'.padEnd(12)} ${'TPS (t/s)'.padEnd(12)} ${'PL (t/s)'.padEnd(12)} ${'TG stddev'.padEnd(10)}`,
     `${'-'.repeat(92)}`,
   ];
 
   for (const r of allResults.results) {
     if (r.error) {
-      summaryLines.push(`${(r.model || '').padEnd(22)} ${(r.backend || '').padEnd(10)} ${String(r.pp).padEnd(6)} ERROR: ${r.error}`);
+      summaryLines.push(`${(r.model || '').padEnd(22)} ${(r.backend || '').padEnd(10)} ${String(r.pl).padEnd(6)} ERROR: ${r.error}`);
     } else if (r.ttftMs !== undefined) {
       summaryLines.push(
-        `${(r.model || '').padEnd(22)} ${(r.backend || '').padEnd(10)} ${String(r.pp).padEnd(6)} ${String(r.ttftMs?.toFixed(2) || '').padEnd(12)} ${String(r.tgTs?.toFixed(2) || '').padEnd(12)} ${String(r.ppTs?.toFixed(2) || '').padEnd(12)} ${String(r.tgStddevTs?.toFixed(2) || '').padEnd(10)}`
+        `${(r.model || '').padEnd(22)} ${(r.backend || '').padEnd(10)} ${String(r.pl).padEnd(6)} ${String(r.ttftMs?.toFixed(2) || '').padEnd(12)} ${String(r.tgTs?.toFixed(2) || '').padEnd(12)} ${String(r.plTs?.toFixed(2) || '').padEnd(12)} ${String(r.tgStddevTs?.toFixed(2) || '').padEnd(10)}`
       );
     }
   }
