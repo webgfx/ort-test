@@ -61,10 +61,10 @@ function resolveVersion(requested) {
   return versions[0].name;
 }
 
-function parseArgs() {
+function parseArgs(options = {}) {
   const args = process.argv.slice(2);
   const opts = {
-    backend: null,             // null = run both cuda and vulkan
+    backends: null,            // null = default ['vulkan']
     models: ['Qwen3-1.7B-Q8_0'],  // supports multiple models
     promptLengths: null,       // null = use DEFAULT_PROMPT_LENGTHS
     gl: 128,
@@ -76,10 +76,11 @@ function parseArgs() {
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
-      case '--backend':
-      case '-b':
-        opts.backend = args[++i];
+      case '--llamacpp-backend': {
+        const val = args[++i];
+        opts.backends = val.split(',').map(s => s.trim()).filter(Boolean);
         break;
+      }
       case '--model':
       case '-m': {
         const val = args[++i];
@@ -93,8 +94,9 @@ function parseArgs() {
         }
         break;
       }
+      case '--prompt-length':
       case '-pl':
-        opts.promptLengths = [parseInt(args[++i])];
+        opts.promptLengths = args[++i].split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
         break;
       case '-gl':
         opts.gl = parseInt(args[++i]);
@@ -118,6 +120,10 @@ function parseArgs() {
         printHelp();
         process.exit(0);
       default:
+        if (options.lenient) {
+          if (args[i].startsWith('-') && i + 1 < args.length && !args[i + 1].startsWith('-')) i++;
+          break;
+        }
         console.error(`Unknown option: ${args[i]}`);
         printHelp();
         process.exit(1);
@@ -136,7 +142,7 @@ function printHelp() {
 Usage: node scripts/perf-test-llamacpp.js [options]
 
 Options:
-  -b, --backend <name>       Backend: cuda, vulkan, or omit for both (default: both)
+  --llamacpp-backend <list>  Backend(s): cuda, vulkan, comma-separated (default: vulkan)
   -m, --model <name>         Model name(s), comma-separated or repeated (default: Qwen3-1.7B-Q8_0)
   -V, --version <ver>        llama.cpp version, e.g. b8200 (default: latest local)
   --update-llama             Download latest llama.cpp before running
@@ -348,6 +354,15 @@ function findModel(modelName) {
       path.join(root, `${modelName}.gguf`),
     );
 
+    // If modelName matches a directory, use the first .gguf file in it
+    const modelDir = path.join(root, modelName);
+    if (fs.existsSync(modelDir) && fs.statSync(modelDir).isDirectory()) {
+      try {
+        const ggufFiles = fs.readdirSync(modelDir).filter(f => f.endsWith('.gguf'));
+        if (ggufFiles.length > 0) candidates.push(path.join(modelDir, ggufFiles[0]));
+      } catch {}
+    }
+
     // Search subdirectories for matching GGUF files (case-insensitive)
     if (fs.existsSync(root)) {
       const dirs = fs.readdirSync(root, { withFileTypes: true }).filter(d => d.isDirectory());
@@ -463,9 +478,9 @@ function runBench(backend, modelPath, pp, tg, reps, ngl, versionDir) {
 // Main
 // ============================================================
 
-async function main() {
-  const opts = parseArgs();
-  const backends = opts.backend ? [opts.backend] : ['cuda', 'vulkan'];
+async function main(options = {}) {
+  const opts = parseArgs(options);
+  const backends = opts.backends || ['vulkan'];
 
   // Download latest if --update-llama is specified
   if (opts.updateLlama) {
@@ -473,8 +488,7 @@ async function main() {
     try {
       await downloadLlamaCpp(opts.version);
     } catch (err) {
-      console.error(`[update-llama] Download failed: ${err.message}`);
-      process.exit(1);
+      throw new Error(`[update-llama] Download failed: ${err.message}`);
     }
     console.log('');
   }
@@ -489,8 +503,7 @@ async function main() {
     return fs.existsSync(path.join(dir, 'llama-bench.exe'));
   });
   if (availableBackends.length === 0) {
-    console.error(`No backends found in ${versionDir}. Available subdirs: ${fs.existsSync(versionDir) ? fs.readdirSync(versionDir).join(', ') : '(dir missing)'}`);
-    process.exit(1);
+    throw new Error(`No backends found in ${versionDir}. Available subdirs: ${fs.existsSync(versionDir) ? fs.readdirSync(versionDir).join(', ') : '(dir missing)'}`);
   }
 
   // Find models
@@ -498,8 +511,7 @@ async function main() {
   for (const modelName of opts.models) {
     const modelPath = findModel(modelName);
     if (!modelPath) {
-      console.error(`Model not found: ${modelName}`);
-      process.exit(1);
+      throw new Error(`Model not found: ${modelName}`);
     }
     modelEntries.push({ name: modelName, path: modelPath });
   }
@@ -516,17 +528,20 @@ async function main() {
   // Use first available version as primary
   const primaryVersion = Object.values(llamaCppVersions)[0];
 
-  // Create timestamped result folder
-  const now = new Date();
-  const timestamp = [
-    now.getFullYear(),
-    String(now.getMonth() + 1).padStart(2, '0'),
-    String(now.getDate()).padStart(2, '0'),
-    String(now.getHours()).padStart(2, '0'),
-    String(now.getMinutes()).padStart(2, '0'),
-    String(now.getSeconds()).padStart(2, '0'),
-  ].join('');
-  const resultDir = path.join(RESULTS_DIR, timestamp);
+  // Create timestamped result folder (or use shared one from caller)
+  let resultDir = options.resultDir;
+  if (!resultDir) {
+    const now = new Date();
+    const timestamp = [
+      now.getFullYear(),
+      String(now.getMonth() + 1).padStart(2, '0'),
+      String(now.getDate()).padStart(2, '0'),
+      String(now.getHours()).padStart(2, '0'),
+      String(now.getMinutes()).padStart(2, '0'),
+      String(now.getSeconds()).padStart(2, '0'),
+    ].join('');
+    resultDir = path.join(RESULTS_DIR, timestamp);
+  }
   fs.mkdirSync(resultDir, { recursive: true });
 
   console.log(`${'='.repeat(60)}`);
@@ -619,57 +634,65 @@ async function main() {
     }
   }
 
-  // Write results
-  const resultFile = path.join(resultDir, 'llamacpp-results.json');
-  fs.writeFileSync(resultFile, JSON.stringify(allResults, null, 2));
+  // Write results (skip when called from unified runner)
+  if (!options.resultDir) {
+    const resultFile = path.join(resultDir, 'llamacpp-results.json');
+    fs.writeFileSync(resultFile, JSON.stringify(allResults, null, 2));
 
-  // Also write a human-readable summary
-  const summaryLines = [
-    `llama.cpp Benchmark Results`,
-    `${'='.repeat(60)}`,
-    ``,
-    `System Information`,
-    `  CPU:        ${sysInfo.cpu}`,
-    `  CPU Cores:  ${sysInfo.cpuCores}`,
-    `  GPU:        ${sysInfo.gpu}`,
-    `  GPU Driver: ${sysInfo.gpuDriver}`,
-    `  GPU Memory: ${sysInfo.gpuMemoryMB} MB`,
-    `  OS:         ${sysInfo.os}`,
-    `  RAM:        ${sysInfo.totalMemoryGB} GB`,
-    `  Timestamp:  ${sysInfo.timestamp}`,
-    ``,
-    `Test Configuration`,
-    `  llama.cpp:  ${llamaCppVersion} ${primaryVersion ? `(${primaryVersion.buildCommit})` : ''}`,
-    `  Gen Length: ${opts.gl}`,
-    `  Runs:       ${opts.reps}`,
-    `  Warmup:     1 (llama-bench default)`,
-    `  GPU Layers: ${opts.ngl}`,
-    ``,
-    `Results`,
-    `${'='.repeat(70)}`,
-    `${'Model'.padEnd(22)} ${'Backend'.padEnd(10)} ${'PL'.padEnd(6)} ${'TTFT (ms)'.padEnd(12)} ${'TPS (t/s)'.padEnd(12)} ${'PL (t/s)'.padEnd(12)} ${'TG stddev'.padEnd(10)}`,
-    `${'-'.repeat(92)}`,
-  ];
+    // Also write a human-readable summary
+    const summaryLines = [
+      `llama.cpp Benchmark Results`,
+      `${'='.repeat(60)}`,
+      ``,
+      `System Information`,
+      `  CPU:        ${sysInfo.cpu}`,
+      `  CPU Cores:  ${sysInfo.cpuCores}`,
+      `  GPU:        ${sysInfo.gpu}`,
+      `  GPU Driver: ${sysInfo.gpuDriver}`,
+      `  GPU Memory: ${sysInfo.gpuMemoryMB} MB`,
+      `  OS:         ${sysInfo.os}`,
+      `  RAM:        ${sysInfo.totalMemoryGB} GB`,
+      `  Timestamp:  ${sysInfo.timestamp}`,
+      ``,
+      `Test Configuration`,
+      `  llama.cpp:  ${llamaCppVersion} ${primaryVersion ? `(${primaryVersion.buildCommit})` : ''}`,
+      `  Gen Length: ${opts.gl}`,
+      `  Runs:       ${opts.reps}`,
+      `  Warmup:     1 (llama-bench default)`,
+      `  GPU Layers: ${opts.ngl}`,
+      ``,
+      `Results`,
+      `${'='.repeat(70)}`,
+      `${'Model'.padEnd(22)} ${'Backend'.padEnd(10)} ${'PL'.padEnd(6)} ${'TTFT (ms)'.padEnd(12)} ${'TPS (t/s)'.padEnd(12)} ${'PL (t/s)'.padEnd(12)} ${'TG stddev'.padEnd(10)}`,
+      `${'-'.repeat(92)}`,
+    ];
 
-  for (const r of allResults.results) {
-    if (r.error) {
-      summaryLines.push(`${(r.model || '').padEnd(22)} ${(r.backend || '').padEnd(10)} ${String(r.pl).padEnd(6)} ERROR: ${r.error}`);
-    } else if (r.ttftMs !== undefined) {
-      summaryLines.push(
-        `${(r.model || '').padEnd(22)} ${(r.backend || '').padEnd(10)} ${String(r.pl).padEnd(6)} ${String(r.ttftMs?.toFixed(2) || '').padEnd(12)} ${String(r.tgTs?.toFixed(2) || '').padEnd(12)} ${String(r.plTs?.toFixed(2) || '').padEnd(12)} ${String(r.tgStddevTs?.toFixed(2) || '').padEnd(10)}`
-      );
+    for (const r of allResults.results) {
+      if (r.error) {
+        summaryLines.push(`${(r.model || '').padEnd(22)} ${(r.backend || '').padEnd(10)} ${String(r.pl).padEnd(6)} ERROR: ${r.error}`);
+      } else if (r.ttftMs !== undefined) {
+        summaryLines.push(
+          `${(r.model || '').padEnd(22)} ${(r.backend || '').padEnd(10)} ${String(r.pl).padEnd(6)} ${String(r.ttftMs?.toFixed(2) || '').padEnd(12)} ${String(r.tgTs?.toFixed(2) || '').padEnd(12)} ${String(r.plTs?.toFixed(2) || '').padEnd(12)} ${String(r.tgStddevTs?.toFixed(2) || '').padEnd(10)}`
+        );
+      }
     }
+
+    const summaryFile = path.join(resultDir, 'llamacpp-results.txt');
+    fs.writeFileSync(summaryFile, summaryLines.join('\n'));
+
+    console.log(`\nResults saved to:`);
+    console.log(`  JSON: ${resultFile}`);
+    console.log(`  Text: ${summaryFile}`);
   }
 
-  const summaryFile = path.join(resultDir, 'llamacpp-results.txt');
-  fs.writeFileSync(summaryFile, summaryLines.join('\n'));
-
-  console.log(`\nResults saved to:`);
-  console.log(`  JSON: ${resultFile}`);
-  console.log(`  Text: ${summaryFile}`);
+  return allResults;
 }
 
-main().catch(err => {
-  console.error(`Error: ${err.message}`);
-  process.exit(1);
-});
+module.exports = { main };
+
+if (require.main === module) {
+  main().catch(err => {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  });
+}

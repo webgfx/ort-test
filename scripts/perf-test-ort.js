@@ -22,7 +22,7 @@ const config = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'config.jso
 const ORT_PATH = config.paths.onnxruntime;
 const GENAI_PATH = config.paths['onnxruntime-genai'];
 const BUILD_CONFIG = config.build.config;
-const OS_DIR = process.platform === 'win32' ? 'Windows' : 'Linux';
+const NATIVE_BUILD_DIR = 'native';
 const BIN_DIR = path.resolve(path.join(__dirname, '..', config.paths.bin));
 const ORT_BACKUP_ROOT = config.paths['ort-backup'] || path.join(BIN_DIR, '..', 'ort-backup');
 const MODEL_ROOT = config.paths.models;
@@ -44,12 +44,12 @@ function getBinarySources() {
     'onnxruntime.dll': path.join(ORT_INSTALL_DIR, 'bin', 'onnxruntime.dll'),
 
     // Dawn DLLs from ORT build (not included in cmake install)
-    'dxcompiler.dll': path.join(ORT_PATH, 'build', OS_DIR, BUILD_CONFIG, BUILD_CONFIG, 'dxcompiler.dll'),
-    'dxil.dll': path.join(ORT_PATH, 'build', OS_DIR, BUILD_CONFIG, BUILD_CONFIG, 'dxil.dll'),
+    'dxcompiler.dll': path.join(ORT_PATH, 'build', NATIVE_BUILD_DIR, BUILD_CONFIG, BUILD_CONFIG, 'dxcompiler.dll'),
+    'dxil.dll': path.join(ORT_PATH, 'build', NATIVE_BUILD_DIR, BUILD_CONFIG, BUILD_CONFIG, 'dxil.dll'),
 
     // From GenAI build
-    'model_benchmark.exe': path.join(GENAI_PATH, 'build', OS_DIR, BUILD_CONFIG, 'benchmark', 'c', BUILD_CONFIG, 'model_benchmark.exe'),
-    'onnxruntime-genai.dll': path.join(GENAI_PATH, 'build', OS_DIR, BUILD_CONFIG, BUILD_CONFIG, 'onnxruntime-genai.dll'),
+    'model_benchmark.exe': path.join(GENAI_PATH, 'build', NATIVE_BUILD_DIR, BUILD_CONFIG, 'benchmark', 'c', BUILD_CONFIG, 'model_benchmark.exe'),
+    'onnxruntime-genai.dll': path.join(GENAI_PATH, 'build', NATIVE_BUILD_DIR, BUILD_CONFIG, BUILD_CONFIG, 'onnxruntime-genai.dll'),
   };
 }
 
@@ -133,8 +133,7 @@ function copyBinaries() {
 
   console.log(`\nDone: ${success} copied, ${failed} missing.`);
   if (failed > 0) {
-    console.error('Some binaries are missing. Run "node scripts/build-ort.js all" first.');
-    process.exit(1);
+    throw new Error('Some binaries are missing. Run "node scripts/build-ort.js all" first.');
   }
 }
 
@@ -161,7 +160,7 @@ function resolveBinDir(requestedVersion) {
       const available = getAvailableVersions();
       console.error(`ORT version ${requestedVersion} not found.`);
       console.error(`Available: ${available.length > 0 ? available.join(', ') : '(none)'}`);
-      process.exit(1);
+      throw new Error(`ORT version ${requestedVersion} not found.`);
     }
     return dir;
   }
@@ -170,7 +169,7 @@ function resolveBinDir(requestedVersion) {
   if (versions.length === 0) {
     console.error(`No ORT backups found in ${ORT_BACKUP_ROOT}.`);
     console.error('Run "node scripts/build-ort.js all" first, then run this script to copy binaries.');
-    process.exit(1);
+    throw new Error(`No ORT backups found in ${ORT_BACKUP_ROOT}.`);
   }
 
   return path.join(ORT_BACKUP_ROOT, versions[0]);
@@ -180,7 +179,7 @@ function resolveBinDir(requestedVersion) {
 // Parse CLI arguments
 // ============================================================
 
-function parseArgs() {
+function parseArgs(options = {}) {
   const args = process.argv.slice(2);
   const opts = {
     models: [Object.keys(config.models)[0]],
@@ -212,7 +211,7 @@ function parseArgs() {
       }
       case '--prompt-length':
       case '-pl':
-        opts.promptLengths = [parseInt(args[++i])];
+        opts.promptLengths = args[++i].split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
         break;
       case '--gen-length':
       case '-gl':
@@ -233,8 +232,7 @@ function parseArgs() {
       case '-ml':
         opts.maxLength = parseInt(args[++i]);
         break;
-      case '--ep':
-      case '-e':
+      case '--ort-backend':
         opts.ep = args[++i];
         break;
       case '--ort-version':
@@ -256,6 +254,10 @@ function parseArgs() {
         printHelp();
         process.exit(0);
       default:
+        if (options.lenient) {
+          if (args[i].startsWith('-') && i + 1 < args.length && !args[i + 1].startsWith('-')) i++;
+          break;
+        }
         console.error(`Unknown option: ${args[i]}`);
         printHelp();
         process.exit(1);
@@ -275,7 +277,7 @@ Usage: node scripts/perf-test-ort.js [options]
 
 Options:
   -m, --model <name>          Model name(s), comma-separated (default: ${Object.keys(config.models)[0]})
-  -e, --ep <provider>         Execution provider: cuda, cpu (default: WebGPU via native build)
+  --ort-backend <provider>    Execution provider: webgpu, cuda, cpu (default: WebGPU via native build)
   -V, --ort-version <date>    ORT backup version to use, yyyymmdd (default: latest)
   --gc                        Enable graph capture in genai_config.json
   --no-gc                     Disable graph capture in genai_config.json
@@ -395,7 +397,7 @@ function runBenchOnce(binDir, modelPath, pl, genLength, iterations, warmup, maxL
     '-w', warmup.toString(),
   ];
 
-  if (ep) {
+  if (ep && ep !== 'webgpu') {
     benchArgs.push('-e', ep);
   }
 
@@ -425,8 +427,8 @@ function runBenchOnce(binDir, modelPath, pl, genLength, iterations, warmup, maxL
 // Main
 // ============================================================
 
-function main() {
-  const opts = parseArgs();
+function main(options = {}) {
+  const opts = parseArgs(options);
 
   // Copy new build outputs to backup (independent of benchmark run)
   let binDir = BIN_DIR;
@@ -441,9 +443,7 @@ function main() {
   for (const modelName of opts.models) {
     const modelPath = findModelPath(modelName);
     if (!modelPath) {
-      console.error(`Model not found: ${modelName}`);
-      console.error(`Searched: ${modelName}, ${MODEL_ROOT}/${modelName}, ${MODEL_ROOT}/${modelName}/onnx, config.models`);
-      process.exit(1);
+      throw new Error(`Model not found: ${modelName}. Searched: ${modelName}, ${MODEL_ROOT}/${modelName}, ${MODEL_ROOT}/${modelName}/onnx, config.models`);
     }
     // Read and optionally set enableGraphCapture in genai_config.json
     let graphCapture = null;
@@ -486,17 +486,20 @@ function main() {
   const sysInfo = getSystemInfo();
   const epName = opts.ep || 'webgpu';
 
-  // Create timestamped result folder
-  const now = new Date();
-  const timestamp = [
-    now.getFullYear(),
-    String(now.getMonth() + 1).padStart(2, '0'),
-    String(now.getDate()).padStart(2, '0'),
-    String(now.getHours()).padStart(2, '0'),
-    String(now.getMinutes()).padStart(2, '0'),
-    String(now.getSeconds()).padStart(2, '0'),
-  ].join('');
-  const resultDir = path.join(RESULTS_DIR, timestamp);
+  // Create timestamped result folder (or use shared one from caller)
+  let resultDir = options.resultDir;
+  if (!resultDir) {
+    const now = new Date();
+    const timestamp = [
+      now.getFullYear(),
+      String(now.getMonth() + 1).padStart(2, '0'),
+      String(now.getDate()).padStart(2, '0'),
+      String(now.getHours()).padStart(2, '0'),
+      String(now.getMinutes()).padStart(2, '0'),
+      String(now.getSeconds()).padStart(2, '0'),
+    ].join('');
+    resultDir = path.join(RESULTS_DIR, timestamp);
+  }
   fs.mkdirSync(resultDir, { recursive: true });
 
   console.log(`${'='.repeat(60)}`);
@@ -564,53 +567,55 @@ function main() {
     }
   }
 
-  // Write JSON results
-  const resultFile = path.join(resultDir, 'ort-results.json');
-  fs.writeFileSync(resultFile, JSON.stringify(allResults, null, 2));
+  // Write results (skip when called from unified runner)
+  if (!options.resultDir) {
+    const resultFile = path.join(resultDir, 'ort-results.json');
+    fs.writeFileSync(resultFile, JSON.stringify(allResults, null, 2));
 
-  // Write human-readable summary
-  const summaryLines = [
-    `ORT GenAI Benchmark Results`,
-    `${'='.repeat(60)}`,
-    ``,
-    `System Information`,
-    `  CPU:        ${sysInfo.cpu}`,
-    `  CPU Cores:  ${sysInfo.cpuCores}`,
-    `  GPU:        ${sysInfo.gpu}`,
-    `  GPU Driver: ${sysInfo.gpuDriver}`,
-    `  GPU Memory: ${sysInfo.gpuMemoryMB || 'N/A'} MB`,
-    `  OS:         ${sysInfo.os}`,
-    `  RAM:        ${sysInfo.totalMemoryGB} GB`,
-    `  Timestamp:  ${sysInfo.timestamp}`,
-    ``,
-    `Test Configuration`,
-    `  EP:         ${epName}`,
-    `  Gen Length: ${opts.genLength}`,
-    `  Runs:       ${opts.iterations}`,
-    `  Warmup:     ${opts.warmup}`,
-    ``,
-    `Results`,
-    `${'='.repeat(92)}`,
-    `${'Model'.padEnd(22)} ${'EP'.padEnd(10)} ${'PL'.padEnd(6)} ${'TTFT (ms)'.padEnd(12)} ${'TPS (t/s)'.padEnd(12)} ${'PL (t/s)'.padEnd(12)} ${'E2E (ms)'.padEnd(10)}`,
-    `${'-'.repeat(92)}`,
-  ];
+    // Write human-readable summary
+    const summaryLines = [
+      `ORT GenAI Benchmark Results`,
+      `${'='.repeat(60)}`,
+      ``,
+      `System Information`,
+      `  CPU:        ${sysInfo.cpu}`,
+      `  CPU Cores:  ${sysInfo.cpuCores}`,
+      `  GPU:        ${sysInfo.gpu}`,
+      `  GPU Driver: ${sysInfo.gpuDriver}`,
+      `  GPU Memory: ${sysInfo.gpuMemoryMB || 'N/A'} MB`,
+      `  OS:         ${sysInfo.os}`,
+      `  RAM:        ${sysInfo.totalMemoryGB} GB`,
+      `  Timestamp:  ${sysInfo.timestamp}`,
+      ``,
+      `Test Configuration`,
+      `  EP:         ${epName}`,
+      `  Gen Length: ${opts.genLength}`,
+      `  Runs:       ${opts.iterations}`,
+      `  Warmup:     ${opts.warmup}`,
+      ``,
+      `Results`,
+      `${'='.repeat(92)}`,
+      `${'Model'.padEnd(22)} ${'EP'.padEnd(10)} ${'PL'.padEnd(6)} ${'TTFT (ms)'.padEnd(12)} ${'TPS (t/s)'.padEnd(12)} ${'PL (t/s)'.padEnd(12)} ${'E2E (ms)'.padEnd(10)}`,
+      `${'-'.repeat(92)}`,
+    ];
 
-  for (const r of allResults.results) {
-    if (r.error) {
-      summaryLines.push(`${(r.model || '').padEnd(22)} ${(r.ep || '').padEnd(10)} ${String(r.pl).padEnd(6)} ERROR: ${r.error.split('\n')[0]}`);
-    } else if (r.ttftMs !== undefined) {
-      summaryLines.push(
-        `${(r.model || '').padEnd(22)} ${(r.ep || '').padEnd(10)} ${String(r.pl).padEnd(6)} ${String(r.ttftMs?.toFixed(2) || '').padEnd(12)} ${String(r.tgTs?.toFixed(2) || '').padEnd(12)} ${String(r.plTs?.toFixed(2) || '').padEnd(12)} ${String(r.e2eMs?.toFixed(0) || '').padEnd(10)}`
-      );
+    for (const r of allResults.results) {
+      if (r.error) {
+        summaryLines.push(`${(r.model || '').padEnd(22)} ${(r.ep || '').padEnd(10)} ${String(r.pl).padEnd(6)} ERROR: ${r.error.split('\n')[0]}`);
+      } else if (r.ttftMs !== undefined) {
+        summaryLines.push(
+          `${(r.model || '').padEnd(22)} ${(r.ep || '').padEnd(10)} ${String(r.pl).padEnd(6)} ${String(r.ttftMs?.toFixed(2) || '').padEnd(12)} ${String(r.tgTs?.toFixed(2) || '').padEnd(12)} ${String(r.plTs?.toFixed(2) || '').padEnd(12)} ${String(r.e2eMs?.toFixed(0) || '').padEnd(10)}`
+        );
+      }
     }
+
+    const summaryFile = path.join(resultDir, 'ort-results.txt');
+    fs.writeFileSync(summaryFile, summaryLines.join('\n'));
+
+    console.log(`\nResults saved to:`);
+    console.log(`  JSON: ${resultFile}`);
+    console.log(`  Text: ${summaryFile}`);
   }
-
-  const summaryFile = path.join(resultDir, 'ort-results.txt');
-  fs.writeFileSync(summaryFile, summaryLines.join('\n'));
-
-  console.log(`\nResults saved to:`);
-  console.log(`  JSON: ${resultFile}`);
-  console.log(`  Text: ${summaryFile}`);
 
   // Restore enableGraphCapture to original value if changed
   for (const me of modelEntries) {
@@ -632,6 +637,8 @@ function main() {
       } catch {}
     }
   }
+
+  return allResults;
 }
 
 /**
@@ -680,4 +687,8 @@ function runPython(opts, modelPath) {
   });
 }
 
-main();
+module.exports = { main };
+
+if (require.main === module) {
+  main();
+}

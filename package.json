@@ -5,8 +5,17 @@
   "private": true,
   "scripts": {
     "build": "node scripts/build-ort.js",
-    "perf-test": "node scripts/perf-test-ort.js"
+    "perf-test": "node scripts/perf-test.js",
+    "perf-test-ort": "node scripts/perf-test-ort.js",
+    "perf-test-llamacpp": "node scripts/perf-test-llamacpp.js"
   },
-  "keywords": ["onnxruntime", "benchmark", "performance"],
-  "license": "MIT"
+  "keywords": [
+    "onnxruntime",
+    "benchmark",
+    "performance"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "puppeteer": "^24.38.0"
+  }
 }

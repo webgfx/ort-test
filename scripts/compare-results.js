@@ -24,18 +24,43 @@ function loadResult(dirName) {
     process.exit(1);
   }
 
+  const allResults = [];
+
+  // Load unified results.json (from perf-test.js running multiple runtimes)
+  const unifiedFile = path.join(dir, 'results.json');
+  if (fs.existsSync(unifiedFile)) {
+    const data = JSON.parse(fs.readFileSync(unifiedFile, 'utf8'));
+    if (data.runtimes) {
+      for (const [source, runtimeData] of Object.entries(data.runtimes)) {
+        allResults.push({
+          source,
+          dirName,
+          data: {
+            system: data.system,
+            config: runtimeData.config,
+            results: runtimeData.results || [],
+          },
+        });
+      }
+    }
+  }
+
+  // Load per-runtime *-results.json files
   const files = fs.readdirSync(dir).filter(f => f.endsWith('-results.json'));
-  if (files.length === 0) {
+  for (const file of files) {
+    const data = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8'));
+    const source = file.replace('-results.json', '');
+    // Avoid duplicates if already loaded from unified file
+    if (!allResults.some(r => r.source === source)) {
+      allResults.push({ source, dirName, data });
+    }
+  }
+
+  if (allResults.length === 0) {
     console.error(`No result JSON files found in ${dir}`);
     process.exit(1);
   }
 
-  const allResults = [];
-  for (const file of files) {
-    const data = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8'));
-    const source = file.replace('-results.json', ''); // 'ort', 'llamacpp', etc.
-    allResults.push({ source, dirName, data });
-  }
   return allResults;
 }
 
@@ -44,9 +69,9 @@ function getAvailableResults() {
   return fs.readdirSync(RESULTS_DIR, { withFileTypes: true })
     .filter(d => d.isDirectory() && /^\d{14}$/.test(d.name))
     .map(d => {
-      const files = fs.readdirSync(path.join(RESULTS_DIR, d.name))
-        .filter(f => f.endsWith('-results.json'));
-      return { name: d.name, files };
+      const allFiles = fs.readdirSync(path.join(RESULTS_DIR, d.name));
+      const resultFiles = allFiles.filter(f => f === 'results.json' || f.endsWith('-results.json'));
+      return { name: d.name, files: resultFiles };
     })
     .filter(d => d.files.length > 0)
     .sort((a, b) => b.name.localeCompare(a.name));

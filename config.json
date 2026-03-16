@@ -4,6 +4,7 @@
     "onnxruntime-genai": "E:\\workspace\\project\\test\\onnxruntime-genai",
     "models": "E:\\workspace\\project\\test\\ort-models",
     "ai-models": "E:\\workspace\\project\\test\\ai-models",
+    "ort-models": "E:\\workspace\\project\\ort-models",
     "bin": "gitignore/bin",
     "ort-backup": "E:\\workspace\\project\\test\\backup\\ort",
     "results": "E:\\workspace\\project\\test\\backup\\results",
