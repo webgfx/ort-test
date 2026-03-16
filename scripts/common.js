@@ -58,16 +58,20 @@ function getSystemInfo() {
   };
 
   // Get GPU info via WMI (works for NVIDIA, AMD, Intel)
-  // Fetch all controllers and skip virtual/remote display adapters
+  // Fetch all controllers, skip virtual/remote adapters and disabled devices (ConfigManagerErrorCode=22)
   try {
     const wmi = execSync(
-      'powershell -NoProfile -Command "Get-WmiObject Win32_VideoController | Select-Object Name,DriverVersion,AdapterRAM | ConvertTo-Json"',
+      'powershell -NoProfile -Command "Get-WmiObject Win32_VideoController | Select-Object Name,DriverVersion,AdapterRAM,ConfigManagerErrorCode | ConvertTo-Json"',
       { encoding: 'utf8', timeout: 10000, stdio: 'pipe' }
     ).trim();
     const parsed = JSON.parse(wmi);
     const controllers = Array.isArray(parsed) ? parsed : [parsed];
     const virtualNames = /microsoft remote display|microsoft basic display|hyper-v video|indirect display/i;
-    const obj = controllers.find(c => c && c.Name && !virtualNames.test(c.Name)) || controllers[0];
+    const obj = controllers.find(c =>
+      c && c.Name &&
+      c.ConfigManagerErrorCode !== 22 &&
+      !virtualNames.test(c.Name)
+    ) || controllers[0];
     if (obj && obj.Name) {
       info.gpu = obj.Name.trim();
       if (obj.DriverVersion) info.gpuDriver = obj.DriverVersion.trim();
